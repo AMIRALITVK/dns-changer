@@ -3,10 +3,11 @@
 package dns
 
 import (
-	"context"
-	"os/exec"
+	"fmt"
+	"net"
 	"strings"
-	"time"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 type windowsManager struct{}
@@ -15,96 +16,163 @@ func NewManager() (Manager, error) {
 	return &windowsManager{}, nil
 }
 
-func execOut(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return exec.CommandContext(ctx, name, args...).Output()
-}
+const interfacesKey = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`
 
-func (m *windowsManager) getActiveInterface() (string, error) {
-	out, err := execOut("netsh", "interface", "show", "interface")
+func getActiveInterfaceGUID() (string, error) {
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		return "Ethernet", nil
+		return "", err
 	}
 
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "Connected") {
-			parts := strings.Fields(line)
-			if len(parts) >= 4 {
-				return parts[len(parts)-1], nil
+	activeIPs := make(map[string]struct{})
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
+				activeIPs[ipnet.IP.String()] = struct{}{}
 			}
 		}
 	}
-	return "Ethernet", nil
+
+	if len(activeIPs) == 0 {
+		return "", fmt.Errorf("no active network interface found")
+	}
+
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, interfacesKey, registry.READ)
+	if err != nil {
+		return "", err
+	}
+	defer key.Close()
+
+	guids, err := key.ReadSubKeyNames(-1)
+	if err != nil {
+		return "", err
+	}
+
+	for _, guid := range guids {
+		subKey, err := registry.OpenKey(registry.LOCAL_MACHINE, interfacesKey+`\`+guid, registry.READ)
+		if err != nil {
+			continue
+		}
+
+		// Match by DHCP IP
+		ip, _, err := subKey.GetStringValue("DhcpIPAddress")
+		if err == nil && ip != "" && ip != "0.0.0.0" {
+			if _, ok := activeIPs[ip]; ok {
+				subKey.Close()
+				return guid, nil
+			}
+		}
+
+		// Match by static IP (REG_MULTI_SZ)
+		ips, _, err := subKey.GetStringsValue("IPAddress")
+		if err == nil {
+			for _, ip := range ips {
+				if ip != "" && ip != "0.0.0.0" {
+					if _, ok := activeIPs[ip]; ok {
+						subKey.Close()
+						return guid, nil
+					}
+				}
+			}
+		}
+
+		subKey.Close()
+	}
+
+	return "", fmt.Errorf("no matching registry GUID found for active interface")
+}
+
+func openInterfaceKey(guid string, access uint32) (registry.Key, error) {
+	return registry.OpenKey(registry.LOCAL_MACHINE, interfacesKey+`\`+guid, access)
 }
 
 func (m *windowsManager) SetDNS(servers []string) error {
-	iface, err := m.getActiveInterface()
+	guid, err := getActiveInterfaceGUID()
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	exec.CommandContext(ctx, "netsh", "interface", "ip", "delete", "dns", iface, "all").Run()
-
-	for i, s := range servers {
-		if i == 0 {
-			out, err := execOut("netsh", "interface", "ip", "set", "dns", iface, "static", s)
-			if err != nil {
-				return err
-			}
-			_ = out
-		} else {
-			exec.Command("netsh", "interface", "ip", "add", "dns", iface, s, "index="+string(rune('0'+i))).Run()
-		}
+	key, err := openInterfaceKey(guid, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("cannot open registry (run as admin): %w", err)
 	}
-	return nil
+	defer key.Close()
+
+	return key.SetStringValue("NameServer", strings.Join(servers, " "))
 }
 
 func (m *windowsManager) RemoveDNS() error {
-	iface, err := m.getActiveInterface()
+	guid, err := getActiveInterfaceGUID()
 	if err != nil {
 		return err
 	}
 
-	out, err := execOut("netsh", "interface", "ip", "delete", "dns", iface, "all")
+	key, err := openInterfaceKey(guid, registry.SET_VALUE)
 	if err != nil {
+		return fmt.Errorf("cannot open registry (run as admin): %w", err)
+	}
+	defer key.Close()
+
+	if err := key.DeleteValue("NameServer"); err != nil && err != registry.ErrNotExist {
 		return err
 	}
-	_ = out
-
-	exec.Command("netsh", "interface", "ip", "set", "dns", iface, "dhcp").Run()
 	return nil
 }
 
 func (m *windowsManager) GetCurrentDNS() ([]string, error) {
-	iface, err := m.getActiveInterface()
+	guid, err := getActiveInterfaceGUID()
 	if err != nil {
 		return []string{}, nil
 	}
 
-	out, err := execOut("netsh", "interface", "ip", "show", "dns", iface)
+	key, err := openInterfaceKey(guid, registry.READ)
 	if err != nil {
 		return []string{}, nil
 	}
+	defer key.Close()
 
-	servers := []string{}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "DNS Server") && strings.Contains(line, ".") {
-			parts := strings.Fields(line)
-			for _, p := range parts {
-				if strings.Count(p, ".") == 3 {
-					servers = append(servers, p)
+	dnsStr, _, err := key.GetStringValue("NameServer")
+	if err != nil {
+		dnsStr, _, err = key.GetStringValue("DhcpNameServer")
+		if err != nil {
+			return []string{}, nil
+		}
+	}
+
+	if dnsStr == "" {
+		return []string{}, nil
+	}
+
+	dnsStr = strings.ReplaceAll(dnsStr, ",", " ")
+	return strings.Fields(dnsStr), nil
+}
+
+func (m *windowsManager) GetActiveInterface() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ipnet, ok := addr.(*net.IPNet)
+				if ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+					return iface.Name, nil
 				}
 			}
 		}
 	}
-	return servers, nil
-}
-
-func (m *windowsManager) GetActiveInterface() (string, error) {
-	return m.getActiveInterface()
+	return "", fmt.Errorf("no active interface found")
 }

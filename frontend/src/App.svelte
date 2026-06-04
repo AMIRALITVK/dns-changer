@@ -19,7 +19,10 @@
 
   $: selected = profiles.find(p => p.id === selectedId) || null;
   $: hasProfiles = profiles && profiles.length > 0;
-  $: dnsActive = selected && currentDNS && currentDNS.length > 0 && selected.servers.every(s => currentDNS.includes(s));
+
+  function updateDnsActive() {
+    dnsActive = !!(selected && currentDNS && currentDNS.length > 0 && selected.servers.every(s => currentDNS.includes(s)));
+  }
 
   async function load() {
     loading = true;
@@ -29,6 +32,7 @@
       activeIface = await window.go.main.App.GetActiveInterface();
       currentDNS = await window.go.main.App.GetCurrentDNS();
       profiles = await window.go.main.App.GetProfiles();
+      updateDnsActive();
     } catch (e) {
       setStatus('Error: ' + (e.message || e), 'error');
     } finally {
@@ -36,14 +40,14 @@
     }
   }
 
-  async function refreshDNS() {
-    currentDNS = await window.go.main.App.GetCurrentDNS();
-  }
-
   load();
 
-  function selectProfile(id) {
+  async function selectProfile(id) {
     selectedId = selectedId === id ? null : id;
+    if (selectedId) {
+      currentDNS = await window.go.main.App.GetCurrentDNS();
+    }
+    updateDnsActive();
   }
 
   async function toggleDNS() {
@@ -51,16 +55,17 @@
     if (dnsActive) {
       try {
         await window.go.main.App.RemoveDNS();
-        await refreshDNS();
+        currentDNS = [];
         setStatus('DNS removed — back to DHCP', 'success');
       } catch (e) { setStatus('Remove failed: ' + e, 'error'); }
     } else {
       try {
         await window.go.main.App.SetDNS(selected.servers);
-        await refreshDNS();
+        currentDNS = [...selected.servers];
         setStatus('Applied ' + selected.servers.join(', '), 'success');
       } catch (e) { setStatus('Apply failed: ' + e, 'error'); }
     }
+    updateDnsActive();
   }
 
   function openAdd() {
