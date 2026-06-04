@@ -1,0 +1,19 @@
+# Dependencies
+frontend/node_modules/
+
+# Build output
+build/bin/
+build/*.app/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+go.sum
