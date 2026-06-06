@@ -16,12 +16,23 @@
   let pingRes = {};
   let confirmDelete = null;
   let dnsActive = false;
+  let dragIndex = null;
+  let dragOverIndex = null;
 
-  $: selected = profiles.find(p => p.id === selectedId) || null;
+  const APP_VERSION = '1.1.0';
+  const dhcpProfile = { id: '__dhcp__', name: 'DHCP (Automatic)', servers: [] };
+
+  $: displayProfiles = profiles ? [dhcpProfile, ...profiles] : [dhcpProfile];
+  $: selected = displayProfiles.find(p => p.id === selectedId) || null;
   $: hasProfiles = profiles && profiles.length > 0;
 
   function updateDnsActive() {
-    dnsActive = !!(selected && currentDNS && currentDNS.length > 0 && selected.servers.every(s => currentDNS.includes(s)));
+    if (!selected) { dnsActive = false; return; }
+    if (selected.id === '__dhcp__') {
+      dnsActive = !currentDNS || currentDNS.length === 0;
+    } else {
+      dnsActive = !!(currentDNS && currentDNS.length > 0 && selected.servers.every(s => currentDNS.includes(s)));
+    }
   }
 
   async function load() {
@@ -32,6 +43,15 @@
       activeIface = await window.go.main.App.GetActiveInterface();
       currentDNS = await window.go.main.App.GetCurrentDNS();
       profiles = await window.go.main.App.GetProfiles();
+      if (currentDNS && currentDNS.length > 0) {
+        const matched = profiles.find(p =>
+          p.servers.length === currentDNS.length &&
+          p.servers.every(s => currentDNS.includes(s))
+        );
+        if (matched) selectedId = matched.id;
+      } else {
+        selectedId = '__dhcp__';
+      }
       updateDnsActive();
     } catch (e) {
       setStatus('Error: ' + (e.message || e), 'error');
@@ -52,6 +72,10 @@
 
   async function toggleDNS() {
     if (!selected) { setStatus('Select a profile first', 'warning'); return; }
+    if (selected.id === '__dhcp__') {
+      setStatus('Apply a DNS profile to use custom DNS', 'warning');
+      return;
+    }
     if (dnsActive) {
       try {
         await window.go.main.App.RemoveDNS();
@@ -63,6 +87,24 @@
         await window.go.main.App.SetDNS(selected.servers);
         currentDNS = [...selected.servers];
         setStatus('Applied ' + selected.servers.join(', '), 'success');
+      } catch (e) { setStatus('Apply failed: ' + e, 'error'); }
+    }
+    updateDnsActive();
+  }
+
+  async function applyProfile(profile) {
+    selectedId = profile.id;
+    if (profile.id === '__dhcp__') {
+      try {
+        await window.go.main.App.RemoveDNS();
+        currentDNS = [];
+        setStatus('DNS removed — back to DHCP', 'success');
+      } catch (e) { setStatus('Remove failed: ' + e, 'error'); }
+    } else {
+      try {
+        await window.go.main.App.SetDNS(profile.servers);
+        currentDNS = [...profile.servers];
+        setStatus('Applied ' + profile.servers.join(', '), 'success');
       } catch (e) { setStatus('Apply failed: ' + e, 'error'); }
     }
     updateDnsActive();
@@ -118,6 +160,41 @@
     }
   }
 
+  function handleDragStart(e, index) {
+    dragIndex = index;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', index);
+  }
+
+  function handleDragOver(e, index) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    dragOverIndex = index;
+  }
+
+  function handleDragLeave() {
+    dragOverIndex = null;
+  }
+
+  async function handleDrop(e, index) {
+    e.preventDefault();
+    const from = dragIndex;
+    const to = index;
+    if (from === null || from === to) { dragIndex = null; dragOverIndex = null; return; }
+    const arr = [...profiles];
+    const [moved] = arr.splice(from, 1);
+    arr.splice(to, 0, moved);
+    profiles = arr;
+    await window.go.main.App.ReorderProfiles(profiles.map(p => p.id));
+    dragIndex = null;
+    dragOverIndex = null;
+  }
+
+  function handleDragEnd() {
+    dragIndex = null;
+    dragOverIndex = null;
+  }
+
   async function ping(server) {
     pinging[server] = true; pinging = pinging;
     const r = await window.go.main.App.PingServer(server);
@@ -167,19 +244,6 @@
         </div>
       </div>
 
-      <!-- Toggle Switch -->
-      <button
-        class="toggle-btn"
-        class:active={dnsActive}
-        class:disabled={!selected}
-        on:click={toggleDNS}
-        disabled={!selected}
-      >
-        <div class="toggle-track">
-          <div class="toggle-thumb"></div>
-        </div>
-        <span class="toggle-label">{dnsActive ? 'ON' : 'OFF'}</span>
-      </button>
     </div>
 
     <div class="header-actions">
@@ -209,20 +273,37 @@
         <div class="spinner"></div>
         <span>Loading...</span>
       </div>
-    {:else if hasProfiles}
+    {:else}
       <div class="profile-list">
-        {#each profiles || [] as profile (profile.id)}
+        {#each displayProfiles as profile (profile.id)}
+          {@const isDhcp = profile.id === '__dhcp__'}
           {@const isSelected = profile.id === selectedId}
+          {@const profileIndex = isDhcp ? -1 : profiles.findIndex(p => p.id === profile.id)}
+          {@const isActive = isDhcp ? (!currentDNS || currentDNS.length === 0) : (currentDNS && currentDNS.length > 0 && profile.servers.every(s => currentDNS.includes(s)))}
           <div
             class="profile-card"
+            class:dhcp={isDhcp}
             class:selected={isSelected}
             class:dns-active={isSelected && dnsActive}
+            class:dragging={!isDhcp && dragIndex === profileIndex}
+            class:drag-over={!isDhcp && dragOverIndex === profileIndex && dragIndex !== profileIndex}
+            draggable={!isDhcp}
             on:click={() => selectProfile(profile.id)}
             role="button"
             tabindex="0"
             on:keydown={(e) => e.key === 'Enter' && selectProfile(profile.id)}
+            on:dragstart={(e) => handleDragStart(e, profileIndex)}
+            on:dragover={(e) => handleDragOver(e, profileIndex)}
+            on:dragleave={handleDragLeave}
+            on:drop={(e) => handleDrop(e, profileIndex)}
+            on:dragend={handleDragEnd}
           >
             <div class="card-left">
+              {#if !isDhcp}
+                <div class="drag-handle">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="8" y1="6" x2="16" y2="6"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="18" x2="16" y2="18"/></svg>
+                </div>
+              {/if}
               <div class="radio-circle" class:checked={isSelected}>
                 {#if isSelected}
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M20.285 2l-11.285 11.567-5.286-5.011-3.714 3.716 9 8.728 15-15.285z"/></svg>
@@ -231,61 +312,73 @@
               <div class="card-info">
                 <span class="card-name">{profile.name}</span>
                 <div class="card-servers">
-                  {#each profile.servers || [] as server}
-                    <code>{server}</code>
-                  {/each}
+                  {#if isDhcp}
+                    <span class="dhcp-label">Automatic from router / ISP</span>
+                  {:else}
+                    {#each profile.servers || [] as server}
+                      <code>{server}</code>
+                    {/each}
+                  {/if}
                 </div>
               </div>
             </div>
 
             <div class="card-right" on:click|stopPropagation>
-              <div class="ping-results">
-                {#each profile.servers || [] as server}
-                  {#if pingRes[server]}
-                    <span class="ping-badge" class:ok={pingRes[server].success} class:fail={!pingRes[server].success}>
-                      {pingRes[server].success ? pingRes[server].latency : '✗'}
-                    </span>
-                  {/if}
-                {/each}
-              </div>
+              <button class="btn btn-apply" class:btn-primary={!isActive} class:btn-active={isActive} disabled={isActive} on:click={() => applyProfile(profile)}>
+                {isActive ? 'Activated' : 'Apply'}
+              </button>
 
-              <button class="icon-btn" title="Ping" on:click={() => pingProfile(profile)} disabled={Object.values(pinging).some(v => v)}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
-                </svg>
-              </button>
-              <button class="icon-btn" title="Edit" on:click={() => openEdit(profile)}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                </svg>
-              </button>
-              <button class="icon-btn danger" title="Delete" on:click={() => del(profile.id)}>
-                {#if confirmDelete === profile.id}
-                  <span class="confirm-text">Sure?</span>
-                {:else}
+              {#if !isDhcp}
+                <div class="ping-results">
+                  {#each profile.servers || [] as server}
+                    {#if pingRes[server]}
+                      <span class="ping-badge" class:ok={pingRes[server].success} class:fail={!pingRes[server].success}>
+                        {pingRes[server].success ? pingRes[server].latency : '✗'}
+                      </span>
+                    {/if}
+                  {/each}
+                </div>
+
+                <button class="icon-btn" title="Ping" on:click={() => pingProfile(profile)} disabled={Object.values(pinging).some(v => v)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                    <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
                   </svg>
-                {/if}
-              </button>
+                </button>
+                <button class="icon-btn" title="Edit" on:click={() => openEdit(profile)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                  </svg>
+                </button>
+                <button class="icon-btn danger" title="Delete" on:click={() => del(profile.id)}>
+                  {#if confirmDelete === profile.id}
+                    <span class="confirm-text">Sure?</span>
+                  {:else}
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                    </svg>
+                  {/if}
+                </button>
+              {/if}
             </div>
           </div>
         {/each}
       </div>
-    {:else}
-      <div class="empty">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:.3">
-          <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/>
-        </svg>
-        <p>No DNS profiles yet</p>
-        <button class="btn btn-primary" on:click={openAdd}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          Create your first profile
-        </button>
-      </div>
+      {#if !hasProfiles}
+        <div class="empty">
+          <p>No custom profiles yet</p>
+          <button class="btn btn-primary" on:click={openAdd}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Create your first profile
+          </button>
+        </div>
+      {/if}
     {/if}
   </main>
+
+  <footer class="footer">
+    <span>v{APP_VERSION}</span>
+  </footer>
 </div>
 
 {#if showModal}
@@ -322,7 +415,7 @@
 {/if}
 
 <style>
-  .app { display: flex; flex-direction: column; min-height: 100vh; }
+  .app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
   /* ─── Header ─── */
   .header {
@@ -367,43 +460,6 @@
     font-size: 12px; font-family: monospace;
   }
   .dhcp { font-size: 12px; color: var(--text-muted); font-style: italic; padding: 2px 0; }
-
-  /* ─── Toggle ─── */
-  .toggle-btn {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 4px;
-  }
-  .toggle-btn.disabled { opacity: 0.4; cursor: not-allowed; }
-  .toggle-track {
-    width: 44px; height: 24px;
-    border-radius: 12px;
-    background: rgba(255,255,255,0.1);
-    position: relative;
-    transition: background 0.25s;
-    border: 1px solid rgba(255,255,255,0.06);
-  }
-  .toggle-btn.active .toggle-track { background: var(--primary); border-color: var(--primary); }
-  .toggle-thumb {
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #fff;
-    position: absolute;
-    top: 2px; left: 2px;
-    transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
-    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-  }
-  .toggle-btn.active .toggle-thumb { transform: translateX(20px); }
-  .toggle-label {
-    font-size: 12px; font-weight: 700;
-    letter-spacing: 0.5px;
-    min-width: 26px;
-    color: var(--text-muted);
-  }
-  .toggle-btn.active .toggle-label { color: var(--primary); }
 
   /* ─── Header actions ─── */
   .header-actions {
@@ -462,6 +518,10 @@
   .icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
   .icon-btn.sm { width: 24px; height: 24px; }
   .confirm-text { font-size: 10px; font-weight: 700; color: var(--error); }
+  .btn-apply { padding: 8px 18px; font-size: 12px; font-weight: 700; min-width: 72px; justify-content: center; letter-spacing: 0.3px; }
+  .btn-active { background: var(--success); color: #000; }
+  .btn-active:hover { filter: brightness(1.15); }
+  .btn-active:disabled { opacity: 0.6; cursor: default; filter: none; }
 
   /* ─── Toast ─── */
   .toast {
@@ -478,8 +538,17 @@
   .toast-warning { background: rgba(251,191,36,0.15); color: var(--warning); border: 1px solid rgba(251,191,36,0.2); }
   @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
+  /* ─── Footer ─── */
+  .footer {
+    padding: 12px 28px 20px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-muted);
+    border-top: 1px solid transparent;
+  }
+
   /* ─── Main ─── */
-  .main { flex: 1; padding: 20px 28px; max-width: 720px; width: 100%; margin: 0 auto; }
+  .main { flex: 1; overflow-y: auto; min-height: 0; padding: 20px 28px; max-width: 720px; width: 100%; margin: 0 auto; }
 
   /* ─── Loading ─── */
   .loading {
@@ -528,6 +597,24 @@
     border-color: var(--success);
     box-shadow: 0 0 0 1px rgba(74,222,128,0.25), 0 4px 20px rgba(74,222,128,0.06);
   }
+  .profile-card.dhcp {
+    border-style: dashed;
+    border-color: rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.02);
+  }
+  .profile-card.dhcp:hover { background: rgba(255,255,255,0.05); }
+  .profile-card.dhcp.selected {
+    border-style: dashed;
+    border-color: var(--primary);
+    background: var(--primary-dim);
+    box-shadow: 0 0 0 1px rgba(56,189,248,0.3), 0 4px 20px rgba(56,189,248,0.08);
+  }
+  .profile-card.dhcp.dns-active {
+    border-style: dashed;
+    border-color: var(--success);
+    box-shadow: 0 0 0 1px rgba(74,222,128,0.25), 0 4px 20px rgba(74,222,128,0.06);
+  }
+  .dhcp-label { font-size: 11px; color: var(--text-muted); font-style: italic; }
 
   .card-left { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
 
@@ -556,6 +643,16 @@
   .profile-card.selected .card-servers code { background: rgba(56,189,248,0.1); }
 
   .card-right { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+
+  .profile-card.dragging { opacity: 0.4; }
+  .profile-card.drag-over { border-top: 2px solid var(--primary); }
+  .drag-handle {
+    display: flex; align-items: center; cursor: grab;
+    color: var(--text-muted); padding: 4px; margin-right: 4px;
+    border-radius: 4px; flex-shrink: 0;
+  }
+  .drag-handle:hover { background: var(--surface-hover); color: var(--text); }
+  .profile-card:active .drag-handle { cursor: grabbing; }
 
   .ping-results { display: flex; gap: 3px; }
   .ping-badge {

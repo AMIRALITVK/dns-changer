@@ -34,6 +34,10 @@ export function RemoveDNS() {
   return window['go']['main']['App']['RemoveDNS']();
 }
 
+export function ReorderProfiles(arg1) {
+  return window['go']['main']['App']['ReorderProfiles'](arg1);
+}
+
 export function SetDNS(arg1) {
   return window['go']['main']['App']['SetDNS'](arg1);
 }

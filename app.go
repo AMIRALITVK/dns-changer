@@ -94,6 +94,27 @@ func (a *App) DeleteProfile(id string) error {
 	return a.store.Save(newList)
 }
 
+func (a *App) ReorderProfiles(ids []string) error {
+	if a.store == nil {
+		return nil
+	}
+	list, err := a.store.Load()
+	if err != nil {
+		return err
+	}
+	profileMap := make(map[string]profiles.Profile, len(list))
+	for _, p := range list {
+		profileMap[p.ID] = p
+	}
+	newList := make([]profiles.Profile, 0, len(list))
+	for _, id := range ids {
+		if p, ok := profileMap[id]; ok {
+			newList = append(newList, p)
+		}
+	}
+	return a.store.Save(newList)
+}
+
 func (a *App) SetDNS(servers []string) error {
 	if a.dnsMgr == nil {
 		return nil

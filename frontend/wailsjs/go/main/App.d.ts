@@ -19,6 +19,8 @@ export function PingServer(arg1:string):Promise<pinger.Result>;
 
 export function RemoveDNS():Promise<void>;
 
+export function ReorderProfiles(arg1:Array<string>):Promise<void>;
+
 export function SetDNS(arg1:Array<string>):Promise<void>;
 
 export function UpdateProfile(arg1:string,arg2:string,arg3:Array<string>):Promise<void>;
